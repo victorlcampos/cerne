@@ -16,8 +16,6 @@ update = [
     "dep:libc",
     "dep:self-replace",
     "dep:semver",
-    "dep:serde",
-    "dep:serde_json",
     "dep:sha2",
     "dep:tar",
     "dep:tempfile",

@@ -29,7 +29,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::Duration;
 
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 pub use semver::Version;
@@ -142,38 +141,26 @@ impl Updater {
         &self.current
     }
 
-    /// The latest release, drafts and pre-releases aside.
+    /// The latest release, drafts and pre-releases aside: the one GitHub's
+    /// `releases/latest` page points to. GitHub's pages, unlike its API, set
+    /// no hourly limit on requests without a login, which offices and CI
+    /// runners sharing one address soon reach.
     pub fn latest(&self) -> Result<Release> {
-        #[derive(Deserialize)]
-        struct Json {
-            tag_name: String,
-            assets: Vec<Asset>,
-        }
-        let url = format!("https://api.github.com/repos/{}/releases/latest", self.repo);
+        let url = format!("https://github.com/{}/releases/latest", self.repo);
         let response = self
             .agent
             .get(&url)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
+            .config()
+            .max_redirects(0)
+            .build()
             .call();
-        let body = match response {
-            Ok(mut response) => response
-                .body_mut()
-                .with_config()
-                .limit(4 * 1024 * 1024)
-                .read_to_vec()
-                .context(|| format!("read the latest release of {}", self.repo))?,
+        let response = match response {
+            Ok(response) => response,
             Err(ureq::Error::StatusCode(404)) => {
                 return fail(format!(
-                    "{} has no release yet: https://github.com/{}/releases",
-                    self.repo, self.repo
+                    "found no repository at https://github.com/{}",
+                    self.repo
                 ));
-            }
-            Err(ureq::Error::StatusCode(403 | 429)) => {
-                return fail(
-                    "GitHub turned the request down, most likely its hourly limit for \
-                     requests without a login: try again later",
-                );
             }
             Err(error) => {
                 return fail(format!(
@@ -181,23 +168,32 @@ impl Updater {
                 ));
             }
         };
-        let json: Json = serde_json::from_slice(&body)
-            .context(|| format!("read the latest release of {}", self.repo))?;
-        let version = json
-            .tag_name
+        if !response.status().is_redirection() {
+            return fail(format!(
+                "GitHub answered {} for {url}, not where its latest release is",
+                response.status()
+            ));
+        }
+        let location = response
+            .headers()
+            .get("location")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        let Some(tag) = tag_in(location, &self.repo) else {
+            return fail(format!(
+                "{} has no release yet: https://github.com/{}/releases",
+                self.repo, self.repo
+            ));
+        };
+        let version = tag
             .strip_prefix('v')
             .and_then(|version| Version::parse(version).ok())
             .ok_or_else(|| {
                 Error(format!(
-                    "the latest release's tag {:?} is not like v1.2.3",
-                    json.tag_name
+                    "the latest release's tag {tag:?} is not like v1.2.3"
                 ))
             })?;
-        Ok(Release {
-            version,
-            tag: json.tag_name,
-            assets: json.assets,
-        })
+        Ok(Release { version, tag })
     }
 
     /// Downloads this system's executable from `release`, checks it against
@@ -262,20 +258,67 @@ impl Updater {
     /// Downloads the release's `name` once its line in `SHA256SUMS` vouches
     /// for it.
     fn fetch_verified(&self, release: &Release, name: &str) -> Result<Vec<u8>> {
-        let sums = self.fetch(release.asset("SHA256SUMS", &self.repo)?, 1024 * 1024)?;
+        let sums = self.fetch(release, "SHA256SUMS", 1024 * 1024)?;
         let sums = String::from_utf8(sums).context(|| "read SHA256SUMS".to_owned())?;
-        let bytes = self.fetch(release.asset(name, &self.repo)?, MAX_DOWNLOAD)?;
+        let bytes = self.fetch(release, name, MAX_DOWNLOAD)?;
         verify(&bytes, &sums, name)?;
         Ok(bytes)
     }
 
-    fn fetch(&self, url: &str, limit: u64) -> Result<Vec<u8>> {
-        self.agent
-            .get(url)
-            .call()
-            .and_then(|mut response| response.body_mut().with_config().limit(limit).read_to_vec())
-            .context(|| format!("download {url}"))
+    /// The release's file `name`, always from the app's own repository.
+    fn fetch(&self, release: &Release, name: &str, limit: u64) -> Result<Vec<u8>> {
+        let url = format!(
+            "https://github.com/{}/releases/download/{}/{name}",
+            self.repo, release.tag
+        );
+        match self.agent.get(&url).call() {
+            Ok(mut response) => response
+                .body_mut()
+                .with_config()
+                .limit(limit)
+                .read_to_vec()
+                .context(|| format!("download {url}")),
+            Err(ureq::Error::StatusCode(404)) => fail(format!(
+                "release {} has no {name} (if it just came out, its files may still be \
+                 uploading: try again in a few minutes)",
+                release.tag
+            )),
+            Err(error) => fail(format!("download {url}: {error}")),
+        }
     }
+}
+
+/// The tag in the address `releases/latest` points to,
+/// `https://github.com/<repo>/releases/tag/<tag>`; none when it points to
+/// the release list instead, as it does before the first release.
+fn tag_in(location: &str, repo: &str) -> Option<String> {
+    let path = location
+        .strip_prefix("https://github.com")
+        .unwrap_or(location);
+    let prefix = format!("/{repo}/releases/tag/");
+    let start = path.get(..prefix.len())?;
+    if !start.eq_ignore_ascii_case(&prefix) {
+        return None;
+    }
+    let tag = unescape(&path[prefix.len()..])?;
+    (!tag.is_empty() && !tag.contains('/')).then_some(tag)
+}
+
+/// Undoes the `%XX` escapes of an address.
+fn unescape(text: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(text.len());
+    let mut rest = text.as_bytes();
+    while let Some((&byte, tail)) = rest.split_first() {
+        if byte == b'%' {
+            let hex = std::str::from_utf8(tail.get(..2)?).ok()?;
+            bytes.push(u8::from_str_radix(hex, 16).ok()?);
+            rest = &tail[2..];
+        } else {
+            bytes.push(byte);
+            rest = tail;
+        }
+    }
+    String::from_utf8(bytes).ok()
 }
 
 /// A published release.
@@ -283,43 +326,6 @@ pub struct Release {
     pub version: Version,
     /// The git tag, like "v1.2.3".
     pub tag: String,
-    assets: Vec<Asset>,
-}
-
-#[derive(Deserialize)]
-struct Asset {
-    name: String,
-    browser_download_url: String,
-}
-
-impl Release {
-    /// The address of the asset called `name`, which has to come from the
-    /// app's own repository.
-    fn asset(&self, name: &str, repo: &str) -> Result<&str> {
-        let asset = self
-            .assets
-            .iter()
-            .find(|asset| asset.name == name)
-            .ok_or_else(|| {
-                Error(format!(
-                    "release {} has no {name} (if it just came out, its files may still be \
-                     uploading: try again in a few minutes)",
-                    self.tag
-                ))
-            })?;
-        let official = format!("https://github.com/{repo}/releases/download/").to_lowercase();
-        if !asset
-            .browser_download_url
-            .to_lowercase()
-            .starts_with(&official)
-        {
-            return fail(format!(
-                "release {}'s {name} is not stored in github.com/{repo}",
-                self.tag
-            ));
-        }
-        Ok(&asset.browser_download_url)
-    }
 }
 
 /// A verified executable, waiting beside the running one.
@@ -453,20 +459,6 @@ fn update(repo: &str, bin: &str, version: &str, check: bool) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn release(assets: &[(&str, &str)]) -> Release {
-        Release {
-            version: Version::new(1, 2, 3),
-            tag: "v1.2.3".into(),
-            assets: assets
-                .iter()
-                .map(|&(name, url)| Asset {
-                    name: name.into(),
-                    browser_download_url: url.into(),
-                })
-                .collect(),
-        }
-    }
-
     #[test]
     fn checksums_reject_tampering_and_missing_or_repeated_lines() {
         let bytes = b"verified release";
@@ -491,29 +483,35 @@ mod tests {
     }
 
     #[test]
-    fn assets_come_only_from_the_apps_repository() {
-        let release = release(&[
-            (
-                "SHA256SUMS",
-                "https://github.com/victorlcampos/vitals/releases/download/v1.2.3/SHA256SUMS",
-            ),
-            (
-                "vitals.tar.gz",
-                "https://github.com/someone-else/vitals/releases/download/v1.2.3/vitals.tar.gz",
-            ),
-        ]);
-        assert!(release.asset("SHA256SUMS", "victorlcampos/vitals").is_ok());
-        assert!(release.asset("SHA256SUMS", "VictorLCampos/Vitals").is_ok());
-        assert!(
-            release
-                .asset("vitals.tar.gz", "victorlcampos/vitals")
-                .is_err()
+    fn reads_the_tag_where_the_latest_release_points() {
+        let tag = |location: &str| tag_in(location, "victorlcampos/vitals");
+        let at = "https://github.com/victorlcampos/vitals/releases/tag/";
+        assert_eq!(tag(&format!("{at}v0.2.0")), Some("v0.2.0".into()));
+        assert_eq!(
+            tag("https://github.com/VictorLCampos/Vitals/releases/tag/v1.0.0"),
+            Some("v1.0.0".into())
         );
-        assert!(
-            release
-                .asset("missing.zip", "victorlcampos/vitals")
-                .is_err()
+        assert_eq!(
+            tag("/victorlcampos/vitals/releases/tag/v1.0.0%2Bbuild.7"),
+            Some("v1.0.0+build.7".into())
         );
+        assert_eq!(
+            tag(&format!("{at}v0.1.0+build.26.c54f69252a35")),
+            Some("v0.1.0+build.26.c54f69252a35".into())
+        );
+        // Before the first release, it points to the list of releases.
+        assert_eq!(
+            tag("https://github.com/victorlcampos/vitals/releases"),
+            None
+        );
+        assert_eq!(
+            tag("https://github.com/someone/vitals/releases/tag/v1.0.0"),
+            None
+        );
+        assert_eq!(tag(at), None);
+        assert_eq!(tag(&format!("{at}v1/assets")), None);
+        assert_eq!(tag(&format!("{at}v1%2")), None);
+        assert_eq!(tag(""), None);
     }
 
     #[test]
