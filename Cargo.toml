@@ -1,0 +1,56 @@
+[package]
+name = "cerne"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "The code shared by Victor's Rust apps: self-update from GitHub releases, settings saved as JSON, the 50 terminal themes and pictures of the screen"
+license = "MIT"
+repository = "https://github.com/victorlcampos/cerne"
+readme = "README.md"
+publish = false
+
+[features]
+# Updates the running executable, or a macOS app bundle, from the latest GitHub release.
+update = [
+    "dep:flate2",
+    "dep:libc",
+    "dep:self-replace",
+    "dep:semver",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:sha2",
+    "dep:tar",
+    "dep:tempfile",
+    "dep:ureq",
+    "dep:zip",
+]
+# Settings in one JSON file, saved on every change and shared by copies running side by side.
+store = ["dep:serde", "dep:serde_json"]
+# Matching text regardless of case, accents and punctuation.
+text = ["dep:deunicode"]
+# For ratatui apps: the 50 editor themes and pictures of the screen.
+tui = ["text", "dep:ratatui"]
+
+[dependencies]
+deunicode = { version = "1", optional = true }
+ratatui = { version = "0.30", default-features = false, optional = true }
+semver = { version = "1", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+sha2 = { version = "0.10", optional = true }
+tempfile = { version = "3", optional = true }
+ureq = { version = "3", features = ["platform-verifier"], optional = true }
+
+[target.'cfg(unix)'.dependencies]
+flate2 = { version = "1", optional = true }
+tar = { version = "0.4", default-features = false, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = { version = "0.2", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+self-replace = { version = "1.5", optional = true }
+zip = { version = "4", default-features = false, features = ["deflate"], optional = true }
+
+[package.metadata.docs.rs]
+all-features = true

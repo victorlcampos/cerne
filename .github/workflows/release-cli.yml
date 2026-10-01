@@ -1,0 +1,182 @@
+name: Release CLI
+
+# Builds a Rust command-line app for each system and publishes the GitHub
+# release the way cerne::update expects it: <binary>-<target>.tar.gz (.zip on
+# Windows) holding <binary>-<target>/<binary>, plus SHA256SUMS.
+#
+# An app calls it from its own workflow, on a version tag:
+#
+#   name: Release
+#   on:
+#     push:
+#       tags: ["v*"]
+#   permissions:
+#     contents: write
+#   jobs:
+#     release:
+#       uses: victorlcampos/cerne/.github/workflows/release-cli.yml@v0.1.0
+#       with:
+#         binary: vitals
+#
+# Releasing is then: bump `version` in Cargo.toml, commit, and push the tag
+# with that version (git tag v0.2.0 && git push origin v0.2.0).
+
+on:
+  workflow_call:
+    inputs:
+      binary:
+        description: The executable's name, as Cargo builds it
+        type: string
+        required: true
+      macos-identifier:
+        description: >-
+          Signs the macOS executables ad hoc under this identifier, so macOS
+          knows the app by it from one version to the next and keeps the
+          permissions given to it (the calendars, for one)
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  version:
+    name: Tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - id: version
+        name: Compare the tag with the package's version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::The tag $GITHUB_REF_NAME does not match version $version in Cargo.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: version
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+    env:
+      BINARY: ${{ inputs.binary }}
+      TARGET: ${{ matrix.target }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target "$TARGET"
+
+      - name: Sign under a lasting identifier
+        if: runner.os == 'macOS' && inputs.macos-identifier != ''
+        env:
+          IDENTIFIER: ${{ inputs.macos-identifier }}
+        run: |
+          executable="target/$TARGET/release/$BINARY"
+          codesign --force --sign - --identifier "$IDENTIFIER" \
+            -r="designated => identifier \"$IDENTIFIER\"" "$executable"
+          codesign --display --requirements - "$executable"
+
+      - name: Pack
+        run: |
+          executable="target/$TARGET/release/$BINARY"
+          if [ "$RUNNER_OS" = Windows ]; then executable="$executable.exe"; fi
+          # It runs, and says it is the version being released: what
+          # cerne::update checks before putting it in place.
+          says=$("$executable" --version | tr -d '\r')
+          if [ "$says" != "$BINARY $VERSION" ]; then
+            echo "::error::$executable --version says \"$says\", not \"$BINARY $VERSION\""
+            exit 1
+          fi
+          name="$BINARY-$TARGET"
+          mkdir -p "dist/$name"
+          cp "$executable" "dist/$name/"
+          for doc in README.md LICENSE; do
+            if [ -f "$doc" ]; then cp "$doc" "dist/$name/"; fi
+          done
+          cd dist
+          if [ "$RUNNER_OS" = Windows ]; then
+            archive="$name.zip"
+            python -c 'import shutil, sys; shutil.make_archive(sys.argv[1], "zip", ".", sys.argv[1])' "$name"
+          else
+            archive="$name.tar.gz"
+            COPYFILE_DISABLE=1 tar --no-xattrs -czf "$archive" "$name"
+          fi
+          rm -rf "$name"
+          if command -v sha256sum > /dev/null; then
+            sha256sum "$archive" > "$archive.sha256"
+          else
+            shasum -a 256 "$archive" > "$archive.sha256"
+          fi
+          cat "$archive.sha256"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish the release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish the archives and their SHA-256
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BINARY: ${{ inputs.binary }}
+        run: |
+          cd dist
+          cat ./*.sha256 | tr -d '\r' > SHA256SUMS
+          rm ./*.sha256
+          sha256sum --check SHA256SUMS
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" ./* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" ./* --verify-tag \
+              --title "$BINARY $GITHUB_REF_NAME" --generate-notes \
+              --notes "Unpack the archive for your system and put \`$BINARY\` on your PATH. Already have it? \`$BINARY update\` brings it up to date."
+          fi
