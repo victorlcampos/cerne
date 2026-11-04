@@ -48,7 +48,7 @@ libc = { version = "0.2", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 self-replace = { version = "1.5", optional = true }
-zip = { version = "4", default-features = false, features = ["deflate"], optional = true }
+zip = { version = "9", default-features = false, features = ["deflate"], optional = true }
 
 [package.metadata.docs.rs]
 all-features = true
